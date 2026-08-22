@@ -1,0 +1,40 @@
+[MESSAGES CONTROL]
+# tlwatch is a deliberately single-file field tool (see its own module
+# docstring) with a GUI built as one function per Tk convention, so the
+# checks below are disabled as design opinions that don't fit that shape
+# rather than signals of an actual defect:
+#
+#   missing-*-docstring   -- descriptive names carry the "what"; this
+#                             project's style is to comment only the WHY,
+#                             and most functions/classes here already have
+#                             a docstring exactly where the WHY isn't obvious.
+#   too-many-lines         -- one file is the point: copy it to a field
+#                             laptop and run it, no package to assemble.
+#   too-many-instance-attributes, too-many-arguments,
+#   too-many-positional-arguments, too-many-locals,
+#   too-many-statements, too-many-return-statements
+#                           -- complexity thresholds tuned for typical
+#                             application code; run_gui() in particular is
+#                             one big Tk widget tree by nature, and
+#                             splitting it up would scatter closely related
+#                             UI wiring across functions for no benefit.
+#   import-outside-toplevel -- tkinter, queue, zlib, and the httpx presence
+#                             check are all deliberately deferred so a
+#                             console-only run never pays for a --gui or
+#                             --bytes dependency it doesn't use.
+#   disallowed-name         -- flags ordinary English words (e.g. "bar" for
+#                             an ASCII progress bar / toolbar frame) as if
+#                             they were placeholder names like "foo".
+disable=
+    missing-module-docstring,
+    missing-class-docstring,
+    missing-function-docstring,
+    too-many-lines,
+    too-many-instance-attributes,
+    too-many-arguments,
+    too-many-positional-arguments,
+    too-many-locals,
+    too-many-statements,
+    too-many-return-statements,
+    import-outside-toplevel,
+    disallowed-name,

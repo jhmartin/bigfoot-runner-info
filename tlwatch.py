@@ -32,8 +32,6 @@ import json
 import logging
 import random
 import re
-import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -79,6 +77,11 @@ def _preflight() -> None:
     # from source can be missing it.
     if not getattr(sys, "frozen", False):
         try:
+            # pylint: disable=reimported,redefined-outer-name,unused-import
+            # pylint: disable=import-outside-toplevel
+            # A real import (not importlib.util.find_spec) so a broken
+            # install surfaces the actual ImportError text below, not just
+            # "not found".
             import httpx  # noqa: F401
         except ImportError as e:
             print("tlwatch needs the 'httpx' package, which this Python "
@@ -93,6 +96,7 @@ def _preflight() -> None:
     # when actually needed, so console use never pays for it.
     if "--gui" in sys.argv:
         try:
+            # pylint: disable=unused-import,import-outside-toplevel
             import tkinter  # noqa: F401
             from tkinter import ttk  # noqa: F401
         except ImportError as e:
@@ -117,13 +121,14 @@ def _preflight() -> None:
             print("\nThe console modes work without it -- drop --gui to "
                   "continue now.", file=sys.stderr)
             sys.exit(1)
-    return
 
 
 _preflight()
 
-import httpx  # noqa: E402 -- after _preflight() so a missing install fails
-              # with the actionable message above, not a bare traceback.
+# Imported here, after _preflight(), so a missing install fails with the
+# actionable message above rather than a bare traceback.
+# pylint: disable-next=wrong-import-position
+import httpx  # noqa: E402
 
 
 def _load_tz(key: str):
@@ -137,7 +142,7 @@ def _load_tz(key: str):
     """
     try:
         return ZoneInfo(key)
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
         local = dt.datetime.now().astimezone().tzinfo
         print(f"note: no tz database for {key!r} "
               f"(pip install tzdata to fix); using system local time "
@@ -339,7 +344,7 @@ class Client:
         self.event = event
         self.concurrency = max(1, concurrency)
         self.max_retries = max(1, max_retries)
-        self._etags: dict[str, str] = {}
+        self.etags: dict[str, str] = {}
         self._lock = threading.Lock()
         limits = httpx.Limits(
             max_connections=self.concurrency * 2,
@@ -372,7 +377,7 @@ class Client:
     def _get(self, url: str) -> str | None:
         """Fetch a page. Returns None for 304 (unchanged) or permanent failure."""
         with self._lock:
-            tag = self._etags.get(url)
+            tag = self.etags.get(url)
         hdr = {"If-None-Match": tag} if tag else {}
 
         for attempt in range(self.max_retries):
@@ -398,7 +403,7 @@ class Client:
 
             if et := resp.headers.get("ETag"):
                 with self._lock:
-                    self._etags[url] = et
+                    self.etags[url] = et
             return _decode(resp)
         LOG.warning("giving up on %s", url)
         return None
@@ -426,7 +431,8 @@ class Client:
                 slug = futures[fut]
                 try:
                     r = fut.result()
-                except Exception as e:
+                # One bad page shouldn't sink the whole poll cycle.
+                except Exception as e:  # pylint: disable=broad-exception-caught
                     LOG.debug("%s: %s", slug, e)
                     continue
                 if r is not None:
@@ -814,7 +820,7 @@ def fetch(event: str, concurrency: int, cache: Cache,
           http2: bool = True) -> list[Runner]:
     with Client(event, concurrency, timeout=timeout,
                 max_retries=max_retries, http2=http2) as c:
-        c._etags = cache.etags
+        c.etags = cache.etags
         if not cache.slugs:
             cache.slugs = c.roster()
             LOG.info("roster: %d runners", len(cache.slugs))
@@ -911,7 +917,6 @@ def run_gui(args, cache) -> int:
     freeze the window for the duration.
     """
     import queue
-    import threading
     import tkinter as tk
     from tkinter import font as tkfont
     from tkinter import ttk
@@ -1007,7 +1012,8 @@ def run_gui(args, cache) -> int:
     # Columns carry a raw sort key alongside the display string. Sorting on
     # the rendered text would order "1h34m" before "51m" and " 0.4h out"
     # lexically -- both wrong. Every column sorts on its native value.
-    COLS = [
+    # Constant despite the local scope -- follows UPPER_CASE anyway.
+    COLS = [  # pylint: disable=invalid-name
         ("bib",   "BIB",       60,  "w"),
         ("name",  "NAME",      190, "w"),
         ("mile",  "MILE",      70,  "e"),
@@ -1029,7 +1035,7 @@ def run_gui(args, cache) -> int:
     tree.pack(side="left", fill="both", expand=True)
 
     for key, label, width, anchor in COLS:
-        tree.column(key, width=width, anchor=anchor, stretch=(key == "name"))
+        tree.column(key, width=width, anchor=anchor, stretch=key == "name")
 
     # Tk 8.6.9 has a regression where Treeview ignores tag colours entirely.
     # Fixed in 8.6.10+. Detect it and fall back to a text marker so the stale
@@ -1142,7 +1148,7 @@ def run_gui(args, cache) -> int:
 
     def pick_stripe() -> None:
         from tkinter import colorchooser
-        rgb, hexval = colorchooser.askcolor(
+        _rgb, hexval = colorchooser.askcolor(
             color=stripe["color"], title="Alternating row shade", parent=root)
         if hexval:
             stripe["color"] = hexval
@@ -1163,7 +1169,7 @@ def run_gui(args, cache) -> int:
     ttk.Checkbutton(bar, text="Shade", variable=v_stripe,
                     command=toggle_stripe).pack(side="left", padx=(4, 0))
 
-    v_dark = tk.BooleanVar(value=(theme["name"] == "dark"))
+    v_dark = tk.BooleanVar(value=theme["name"] == "dark")
     ttk.Checkbutton(bar, text="Dark", variable=v_dark,
                     command=toggle_theme).pack(side="left", padx=(4, 0))
 
@@ -1298,13 +1304,13 @@ def run_gui(args, cache) -> int:
                 return cast(var.get())
             except (ValueError, tk.TclError):
                 return default
-        return dict(
-            station=num(v_station, args.station),
-            back=num(v_back, args.back),
-            past=num(v_past, args.past),
-            hours=num(v_hours, args.forecast_hours),
-            bin=max(1, num(v_bin, args.bin, int)),
-        )
+        return {
+            "station": num(v_station, args.station),
+            "back": num(v_back, args.back),
+            "past": num(v_past, args.past),
+            "hours": num(v_hours, args.forecast_hours),
+            "bin": max(1, num(v_bin, args.bin, int)),
+        }
 
     seen: set[str] = set()
 
@@ -1341,7 +1347,8 @@ def run_gui(args, cache) -> int:
                             args.min_age, args.retry_after,
                             args.timeout, args.retries, not args.http1)
             results.put(("ok", runners))
-        except Exception as e:            # keep the window alive on any failure
+        # keep the window alive on any failure
+        except Exception as e:  # pylint: disable=broad-exception-caught
             results.put(("err", e))
 
     def kick() -> None:
