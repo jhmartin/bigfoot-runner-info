@@ -16,7 +16,9 @@ you want to look, and it lists everyone in that stretch, closest first.
     ./tlwatch.py --event bigfoot200-26 --station 171 --back 6 --past 2
 
 Setup:
-    None. Standard library only -- runs on any stock Python 3.11+.
+    Needs the 'httpx' package: py -3 -m pip install "httpx[http2]"
+    (the compiled tlwatch.exe bundles this already -- only matters when
+    running tlwatch.py directly from source). Runs on any stock Python 3.11+.
     The optional --gui mode needs tkinter, which ships with the python.org
     Windows installer (it is sometimes absent from Microsoft Store builds).
 """
@@ -25,18 +27,16 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import gzip
 import html
 import json
 import logging
+import random
 import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,6 +75,19 @@ def _preflight() -> None:
                   file=sys.stderr)
             break
 
+    # A frozen build (PyInstaller) always has httpx bundled; only running
+    # from source can be missing it.
+    if not getattr(sys, "frozen", False):
+        try:
+            import httpx  # noqa: F401
+        except ImportError as e:
+            print("tlwatch needs the 'httpx' package, which this Python "
+                  f"lacks.\n\n  interpreter: {sys.executable}\n  error: {e}\n"
+                  "\nInstall it with:\n"
+                  f"  {sys.executable} -m pip install \"httpx[http2]\"\n",
+                  file=sys.stderr)
+            sys.exit(1)
+
     # tkinter ships with python.org builds but is routinely absent from the
     # Microsoft Store build and from stock Linux distro Python. Only checked
     # when actually needed, so console use never pays for it.
@@ -109,6 +122,9 @@ def _preflight() -> None:
 
 _preflight()
 
+import httpx  # noqa: E402 -- after _preflight() so a missing install fails
+              # with the actionable message above, not a bare traceback.
+
 
 def _load_tz(key: str):
     """Event timezone, degrading gracefully.
@@ -139,6 +155,14 @@ EVENT_TZ = _load_tz("America/Los_Angeles")
 # SPOT units go quiet under canopy constantly; on mountain courses this is
 # normal, not alarming. Flag it so you can weight the position accordingly.
 STALE_MIN = 45
+
+# Tuned for satellite backhaul (Starlink, BGAN, geostationary VSAT), where a
+# single round trip can run 600ms-2000ms+ (or spike far higher under rain
+# fade) and terrestrial-tuned defaults read a merely-slow link as a dead one.
+DEFAULT_TIMEOUT_S = 45.0
+DEFAULT_RETRIES = 5
+BACKOFF_BASE_S = 3.0
+BACKOFF_MAX_S = 60.0
 
 
 # --------------------------------------------------------------------------
@@ -277,65 +301,105 @@ def parse_runner(slug: str, raw: str) -> Runner:
     return r
 
 
+def _backoff(attempt: int, floor: float = 1.0) -> float:
+    """Exponential backoff with jitter, capped.
+
+    Satellite links tend to fail in bursts -- rain fade, a brief obstruction
+    of the line of sight -- rather than cleanly, so the cap is generous and
+    the jitter keeps every worker thread from retrying in lockstep the
+    instant the link comes back.
+    """
+    base = min(BACKOFF_MAX_S, floor * (BACKOFF_BASE_S ** attempt))
+    return base * (0.5 + random.random())
+
+
 class Client:
-    """Polite fetcher, stdlib only.
+    """Polite fetcher, tuned for satellite backhaul.
 
     Trackleaders is a small operation carrying live, safety-relevant traffic
     during an active race. Low concurrency plus conditional GETs keeps repeat
     polls cheap (mostly 304s) -- and getting throttled mid-deployment would be
     worse than a slow poll.
 
-    Uses urllib.request over a small thread pool rather than an async HTTP
-    library. Benchmarked at our operating point (concurrency 4) the two are
-    indistinguishable -- run-to-run network variance exceeds the difference --
-    so the third-party dependency bought nothing and cost an install step on a
-    field laptop. What we give up is connection keep-alive; at ~180 requests
-    per ten-minute cycle the extra handshakes are a couple of seconds.
+    Backed by a single pooled, keep-alive httpx.Client shared across the
+    worker threads rather than one connection per request. On a GEO
+    satellite link a single TCP+TLS handshake can cost several round trips
+    -- multiple seconds -- before the first byte of an actual request goes
+    out; reusing pooled connections for the ~180 requests in a poll cycle
+    amortizes that cost to roughly once per pooled connection instead of
+    once per runner. HTTP/2 multiplexes several in-flight requests over each
+    of those connections, which matters more than raw throughput on a link
+    that is high-latency and occasionally lossy rather than narrowband.
     """
 
-    def __init__(self, event: str, concurrency: int = 4):
+    def __init__(self, event: str, concurrency: int = 4,
+                 timeout: float = DEFAULT_TIMEOUT_S,
+                 max_retries: int = DEFAULT_RETRIES,
+                 http2: bool = True):
         self.event = event
         self.concurrency = max(1, concurrency)
+        self.max_retries = max(1, max_retries)
         self._etags: dict[str, str] = {}
         self._lock = threading.Lock()
+        limits = httpx.Limits(
+            max_connections=self.concurrency * 2,
+            max_keepalive_connections=self.concurrency,
+            # A poll cycle is bursty (all ~180 requests, then nothing until
+            # the next refresh); holding connections open well past that
+            # burst is cheap and saves the next cycle a fresh handshake.
+            keepalive_expiry=120.0,
+        )
+        try:
+            self._client = httpx.Client(
+                http2=http2, headers={"User-Agent": UA}, timeout=timeout,
+                limits=limits, follow_redirects=True)
+        except ImportError:
+            # http2=True needs the optional 'h2' package; degrade instead of
+            # crashing a field deployment over a missing extra.
+            LOG.warning("HTTP/2 requested but 'h2' is not installed "
+                        "(pip install \"httpx[http2]\"); using HTTP/1.1")
+            self._client = httpx.Client(
+                http2=False, headers={"User-Agent": UA}, timeout=timeout,
+                limits=limits, follow_redirects=True)
 
     def __enter__(self):
         return self
 
     def __exit__(self, *e):
+        self._client.close()
         return False
 
     def _get(self, url: str) -> str | None:
         """Fetch a page. Returns None for 304 (unchanged) or permanent failure."""
         with self._lock:
             tag = self._etags.get(url)
-        hdr = {"User-Agent": UA, "Accept-Encoding": "gzip"}
-        if tag:
-            hdr["If-None-Match"] = tag
+        hdr = {"If-None-Match": tag} if tag else {}
 
-        for attempt in range(3):
-            req = urllib.request.Request(url, headers=hdr)
+        for attempt in range(self.max_retries):
             try:
-                with urllib.request.urlopen(req, timeout=20) as resp:
-                    body = _read_body(resp)
-                    if et := resp.headers.get("ETag"):
-                        with self._lock:
-                            self._etags[url] = et
-                    return body
-            except urllib.error.HTTPError as e:
-                # urllib raises on 304 rather than returning it, unlike most
-                # HTTP clients. Not an error for us -- it means "unchanged".
-                if e.code == 304:
-                    return None
-                if e.code == 429 or e.code >= 500:
-                    time.sleep(2 ** attempt * 2)
-                    continue
-                LOG.debug("%s: HTTP %s", url, e.code)
-                return None
-            except (urllib.error.URLError, TimeoutError, OSError) as e:
-                LOG.debug("%s: %s (retry %d)", url, e, attempt + 1)
-                time.sleep(2 ** attempt)
+                resp = self._client.get(url, headers=hdr)
+            except httpx.TimeoutException as e:
+                LOG.debug("%s: timeout (retry %d): %s", url, attempt + 1, e)
+                time.sleep(_backoff(attempt))
                 continue
+            except httpx.TransportError as e:
+                LOG.debug("%s: %s (retry %d)", url, e, attempt + 1)
+                time.sleep(_backoff(attempt))
+                continue
+
+            if resp.status_code == 304:
+                return None
+            if resp.status_code == 429 or resp.status_code >= 500:
+                time.sleep(_backoff(attempt, floor=2.0))
+                continue
+            if resp.status_code >= 400:
+                LOG.debug("%s: HTTP %s", url, resp.status_code)
+                return None
+
+            if et := resp.headers.get("ETag"):
+                with self._lock:
+                    self._etags[url] = et
+            return _decode(resp)
         LOG.warning("giving up on %s", url)
         return None
 
@@ -370,16 +434,10 @@ class Client:
         return out
 
 
-def _read_body(resp) -> str:
-    """Decode a response body, honouring gzip and the declared charset."""
-    raw = resp.read()
-    if resp.headers.get("Content-Encoding", "").lower() == "gzip":
-        try:
-            raw = gzip.decompress(raw)
-        except (OSError, EOFError):
-            pass
-    charset = resp.headers.get_content_charset() or "utf-8"
-    return raw.decode(charset, errors="replace")
+def _decode(resp: "httpx.Response") -> str:
+    """Decode a response body. httpx already handles Content-Encoding."""
+    charset = resp.encoding or "utf-8"
+    return resp.content.decode(charset, errors="replace")
 
 
 # --------------------------------------------------------------------------
@@ -750,8 +808,12 @@ class Cache:
 
 def fetch(event: str, concurrency: int, cache: Cache,
           min_age_min: float = 10.0,
-          retry_min: float = 2.0) -> list[Runner]:
-    with Client(event, concurrency) as c:
+          retry_min: float = 2.0,
+          timeout: float = DEFAULT_TIMEOUT_S,
+          max_retries: int = DEFAULT_RETRIES,
+          http2: bool = True) -> list[Runner]:
+    with Client(event, concurrency, timeout=timeout,
+                max_retries=max_retries, http2=http2) as c:
         c._etags = cache.etags
         if not cache.slugs:
             cache.slugs = c.roster()
@@ -1276,7 +1338,8 @@ def run_gui(args, cache) -> int:
     def worker() -> None:
         try:
             runners = fetch(args.event, args.concurrency, cache,
-                            args.min_age, args.retry_after)
+                            args.min_age, args.retry_after,
+                            args.timeout, args.retries, not args.http1)
             results.put(("ok", runners))
         except Exception as e:            # keep the window alive on any failure
             results.put(("err", e))
@@ -1460,6 +1523,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--clear", action="store_true",
                    help="clear the screen between refreshes")
     p.add_argument("--concurrency", type=int, default=4)
+    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S,
+                   metavar="SEC",
+                   help="per-request timeout in seconds (default "
+                        f"{DEFAULT_TIMEOUT_S:g}; raised well above "
+                        "terrestrial norms for satellite RTT)")
+    p.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
+                   metavar="N",
+                   help="retry attempts per request on timeout/5xx/429 "
+                        f"before giving up (default {DEFAULT_RETRIES})")
+    p.add_argument("--http1", action="store_true",
+                   help="force HTTP/1.1 instead of HTTP/2 -- use if a "
+                        "satellite proxy/PEP breaks HTTP/2")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -1473,7 +1548,8 @@ def main(argv: list[str] | None = None) -> int:
 
     def cycle(seen: set[str]) -> set[str]:
         runners = fetch(args.event, args.concurrency, cache,
-                        args.min_age, args.retry_after)
+                        args.min_age, args.retry_after,
+                        args.timeout, args.retries, not args.http1)
         hits = in_window(runners, args.station, args.back, args.past, args.all)
         current = {r.slug for r in hits}
         # The table is the whole point when no forecast was asked for, so it
