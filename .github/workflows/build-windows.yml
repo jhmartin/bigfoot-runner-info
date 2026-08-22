@@ -1,4 +1,4 @@
-name: Build Windows executable
+name: CI
 
 on:
   push:
@@ -12,7 +12,25 @@ permissions:
   contents: write
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip -r requirements-dev.txt
+
+      - name: Run pylint
+        run: python -m pylint tlwatch.py
+
   build:
+    needs: lint
     runs-on: windows-latest
     steps:
       - name: Check out repo
