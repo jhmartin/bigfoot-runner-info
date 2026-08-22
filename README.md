@@ -82,6 +82,12 @@ of use. Grab it from the [Releases](../../releases) page, or trigger the
 workflow manually from the Actions tab to get a build artifact from any
 branch.
 
+## Development
+
+`pip install -r requirements-dev.txt` pulls in `pylint` alongside the
+runtime dependency. CI runs `pylint tlwatch.py` (config in
+[`.pylintrc`](.pylintrc)) and the Windows build only runs if it's clean.
+
 ## License
 
 Apache License 2.0 -- see [LICENSE](LICENSE).
