@@ -48,12 +48,21 @@ any event Trackleaders tracks.
 - **Optional GUI** (`--gui`) -- a two-pane Tk dashboard (forecast on the
   left, sortable runner detail on the right) with light/dark themes, for
   leaving up on a laptop at the aid station.
+- **Tuned for satellite backhaul** -- pooled, keep-alive HTTP/2 connections
+  (via `httpx`) instead of one handshake per request, generous timeouts,
+  and jittered retry/backoff, so a high-latency, occasionally lossy link
+  (Starlink, BGAN, geostationary VSAT) doesn't get mistaken for a dead one.
+  See `--timeout`, `--retries`, and `--http1` if a satellite proxy/PEP on
+  your link needs different handling.
 
 Run `./tlwatch.py --help` for the full option list.
 
 ## Requirements
 
-- Python 3.11+. No third-party packages -- standard library only.
+- Python 3.11+ and [`httpx`](https://www.python-httpx.org/) with its
+  HTTP/2 extra: `pip install -r requirements.txt` (or
+  `pip install "httpx[http2]"`). Not needed if you're running the
+  [standalone `.exe`](#standalone-windows-executable) -- it's bundled in.
 - `--gui` additionally needs `tkinter`, which ships with the python.org
   Windows/macOS installers but is sometimes missing from the Microsoft
   Store build of Python (`sudo apt install python3-tk` on Debian/Ubuntu,
@@ -64,11 +73,14 @@ Run `./tlwatch.py --help` for the full option list.
 
 ## Standalone Windows executable
 
-Every tagged release is built into a single-file Windows `.exe` (no Python
-install required) by the [`build-windows.yml`](.github/workflows/build-windows.yml)
-GitHub Actions workflow. Grab it from the
-[Releases](../../releases) page, or trigger the workflow manually from the
-Actions tab to get a build artifact from any branch.
+Every tagged release is built into a single-file Windows `.exe` by the
+[`build-windows.yml`](.github/workflows/build-windows.yml) GitHub Actions
+workflow. It bundles Python, `httpx`, and every dependency `httpx` needs
+(including certifi's CA bundle) directly into the executable, so it's fully
+self-contained -- no Python install and no separate downloads at the point
+of use. Grab it from the [Releases](../../releases) page, or trigger the
+workflow manually from the Actions tab to get a build artifact from any
+branch.
 
 ## License
 
