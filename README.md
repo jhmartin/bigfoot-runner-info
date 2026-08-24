@@ -27,10 +27,21 @@ any event Trackleaders tracks.
 
 # two-pane GUI dashboard (forecast + sortable runner table)
 ./tlwatch.py --event bigfoot200-26 --station 171 --back 6 --gui
+
+# no live event handy? try it with 200 fake runners, no network needed
+./tlwatch.py --station 171 --back 6 --gui --demo
 ```
 
 `--event` is the Trackleaders event slug, taken from the tracker URL
 (`trackleaders.com/<event>f.php`) -- e.g. `bigfoot200-26`.
+
+## Demo
+
+`--demo` skips the network entirely and generates 200 fake runners with
+random names, scattered randomly between mile 0 and `--station` -- handy for
+trying out the display and forecast without a live event or connectivity:
+
+![tlwatch --gui --demo](images/demo.png)
 
 ## Features
 
@@ -48,6 +59,9 @@ any event Trackleaders tracks.
 - **Optional GUI** (`--gui`) -- a two-pane Tk dashboard (forecast on the
   left, sortable runner detail on the right) with light/dark themes, for
   leaving up on a laptop at the aid station.
+- **Demo mode** (`--demo`) -- generates 200 fake runners scattered between
+  mile 0 and `--station` so you can try the display/forecast without a live
+  event or network access.
 - **Tuned for satellite backhaul** -- pooled, keep-alive HTTP/2 connections
   (via `httpx`) instead of one handshake per request, generous timeouts,
   and jittered retry/backoff, so a high-latency, occasionally lossy link
