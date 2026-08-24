@@ -868,6 +868,55 @@ def report_size(payload: str) -> None:
           file=sys.stderr)
 
 
+# --------------------------------------------------------------------------
+# demo mode -- synthetic runners, no network needed
+# --------------------------------------------------------------------------
+
+_DEMO_FIRST = [
+    "James", "Mary", "Robert", "Patricia", "John", "Jennifer", "Michael",
+    "Linda", "David", "Elizabeth", "William", "Barbara", "Richard", "Susan",
+    "Joseph", "Jessica", "Thomas", "Sarah", "Charles", "Karen", "Chris",
+    "Nancy", "Daniel", "Lisa", "Matthew", "Betty", "Anthony", "Margaret",
+    "Mark", "Sandra", "Paul", "Ashley", "Steven", "Kimberly", "Andrew",
+    "Emily", "Kenneth", "Donna", "Joshua", "Michelle",
+]
+_DEMO_LAST = [
+    "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller",
+    "Davis", "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez",
+    "Wilson", "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin",
+    "Lee", "Perez", "Thompson", "White", "Harris", "Sanchez", "Clark",
+    "Ramirez", "Lewis", "Robinson", "Walker", "Young", "Allen", "King",
+    "Wright", "Scott", "Torres", "Nguyen", "Hill", "Flores",
+]
+
+
+def demo_runners(station: float, n: int = 200) -> list[Runner]:
+    """Synthesize a roster for offline demo/testing -- no network calls.
+
+    Runners are scattered uniformly from mile 0 to `station` so a demo run
+    exercises the window filter, the arrival forecast, and staleness flagging
+    without needing a live event or connectivity.
+    """
+    hi = max(station, 0.1)
+    now = dt.datetime.now(dt.timezone.utc)
+    out = []
+    for i in range(n):
+        name = f"{random.choice(_DEMO_FIRST)} {random.choice(_DEMO_LAST)}"
+        mile = round(random.uniform(0.0, hi), 1)
+        mph = round(random.uniform(1.2, 3.8), 1)
+        age_min = random.uniform(0, STALE_MIN * 2)
+        out.append(Runner(
+            slug=f"demo_{i:03d}_{name.replace(' ', '_')}",
+            name=name,
+            bib=str(i + 1),
+            status="Active",
+            mile=mile,
+            mph=mph,
+            last_update=now - dt.timedelta(minutes=age_min),
+            next_wpt=None,
+        ))
+    return out
+
 
 # GUI colour palettes. Kept as plain data so a theme switch is one lookup and
 # nothing else in the GUI needs to know which mode it is in.
@@ -1343,9 +1392,12 @@ def run_gui(args, cache) -> int:
     # -- fetching ---------------------------------------------------------
     def worker() -> None:
         try:
-            runners = fetch(args.event, args.concurrency, cache,
-                            args.min_age, args.retry_after,
-                            args.timeout, args.retries, not args.http1)
+            if args.demo:
+                runners = list(cache.runners.values())
+            else:
+                runners = fetch(args.event, args.concurrency, cache,
+                                args.min_age, args.retry_after,
+                                args.timeout, args.retries, not args.http1)
             results.put(("ok", runners))
         # keep the window alive on any failure
         except Exception as e:  # pylint: disable=broad-exception-caught
@@ -1471,9 +1523,14 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--event", required=True, help="e.g. bigfoot200-26")
+    p.add_argument("--event", help="e.g. bigfoot200-26 (not needed with --demo)")
     p.add_argument("--station", type=float, required=True,
                    help="your aid station's course mile")
+    p.add_argument("--demo", action="store_true",
+                   help="skip the network and generate 200 fake runners with "
+                        "random names, scattered randomly between mile 0 and "
+                        "--station -- for trying out the display/forecast "
+                        "without a live event")
     p.add_argument("--back", type=float, default=6.0,
                    help="miles before the station to include (default 6)")
     p.add_argument("--past", type=float, default=0.0,
@@ -1545,18 +1602,35 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
+    if not args.demo and not args.event:
+        p.error("--event is required (unless --demo is set)")
+    args.event = args.event or "demo"
+
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)-7s %(message)s")
 
-    cache = Cache(None if args.no_cache else Path(args.cache), args.event)
+    # Demo runners are synthetic and regenerated every launch, so persisting
+    # them to disk (and risking a real cache file getting clobbered with fake
+    # data) would be actively unhelpful -- keep the cache in-memory only.
+    cache = Cache(None if (args.no_cache or args.demo) else Path(args.cache),
+                 args.event)
+    if args.demo:
+        demo = demo_runners(args.station)
+        cache.slugs = [r.slug for r in demo]
+        cache.runners = {r.slug: r for r in demo}
+        LOG.info("demo: generated %d fake runners between mile 0 and %g",
+                 len(demo), args.station)
 
     if args.gui:
         return run_gui(args, cache)
 
     def cycle(seen: set[str]) -> set[str]:
-        runners = fetch(args.event, args.concurrency, cache,
-                        args.min_age, args.retry_after,
-                        args.timeout, args.retries, not args.http1)
+        if args.demo:
+            runners = list(cache.runners.values())
+        else:
+            runners = fetch(args.event, args.concurrency, cache,
+                            args.min_age, args.retry_after,
+                            args.timeout, args.retries, not args.http1)
         hits = in_window(runners, args.station, args.back, args.past, args.all)
         current = {r.slug for r in hits}
         # The table is the whole point when no forecast was asked for, so it
